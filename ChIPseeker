@@ -11,14 +11,6 @@ txdb <- TxDb.Mmusculus.UCSC.mm10.knownGene
 peak_file <- "HA-Casz1.bed"
 peak <- readPeakFile(peak_file)
 
-## ChIPseeker 选项（根据需要忽略部分注释类别） ----------------------------
-options(
-  ChIPseeker.ignore_1st_exon             = TRUE,
-  ChIPseeker.ignore_1st_intron           = TRUE,
-  ChIPseeker.ignore_downstream           = TRUE,
-  ChIPseeker.ignore_promoter_subcategory = TRUE
-)
-
 ## 峰注释 ------------------------------------------------------------------
 peak_anno <- annotatePeak(
   peak,
