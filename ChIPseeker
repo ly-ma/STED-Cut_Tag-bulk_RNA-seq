@@ -1,0 +1,31 @@
+## 加载依赖包 -------------------------------------------------------------
+library(ChIPseeker)
+library(TxDb.Mmusculus.UCSC.mm10.knownGene)  # 小鼠注释数据库（mm10）
+library(org.Mm.eg.db)                        # 小鼠基因注释
+library(ggplot2)
+
+## 设置 TxDb（小鼠） ------------------------------------------------------
+txdb <- TxDb.Mmusculus.UCSC.mm10.knownGene
+
+## 读入 peak 文件 ---------------------------------------------------------
+peak_file <- "HA-Casz1.bed"
+peak <- readPeakFile(peak_file)
+
+## ChIPseeker 选项（根据需要忽略部分注释类别） ----------------------------
+options(
+  ChIPseeker.ignore_1st_exon             = TRUE,
+  ChIPseeker.ignore_1st_intron           = TRUE,
+  ChIPseeker.ignore_downstream           = TRUE,
+  ChIPseeker.ignore_promoter_subcategory = TRUE
+)
+
+## 峰注释 ------------------------------------------------------------------
+peak_anno <- annotatePeak(
+  peak,
+  TxDb       = txdb,
+  tssRegion  = c(-3000, 3000),  # 可根据需要调整 TSS 上下游范围
+  annoDb     = "org.Mm.eg.db"   # 使用小鼠基因注释库
+)
+
+## 画注释饼图 -------------------------------------------------------------
+plotAnnoPie(peak_anno)
