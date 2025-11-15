@@ -1,0 +1,254 @@
+#!/bin/bash
+# ==================== ChIP-seq Complete Analysis Pipeline ====================
+# Author: lyma
+# Description: Raw data → QC → Alignment → BAM processing → BigWig/plots → Peaks → Motif
+# Tools: fastp / bowtie2 / samtools / deeptools / MACS3 / HOMER
+# ============================================================================
+
+set -euo pipefail
+
+# ----------------- 配置区域（根据实际情况修改） -----------------
+# 原始数据目录（双端：*_R1.fq.gz / *_R2.fq.gz）
+raw_fqdir='Mouse-HA-Casz1/1.rawdata'
+
+# 质控后数据目录
+clean_fqdir='Mouse-HA-Casz1/clean_data'
+
+# Bowtie2 索引前缀（mm10）
+ref_index='ref/index/bowtie2/mm10/mm10'
+
+# TSS bed 文件（供 deepTools 画热图）
+tss_bed='mm10.tss.bed'
+
+# 线程数
+p=20
+
+# 输出结果总目录
+result_dir='./Bam'
+
+# ----------------- 创建目录 -----------------
+mkdir -p "${clean_fqdir}"
+mkdir -p "${result_dir}"
+mkdir -p "${result_dir}/matrix" "${result_dir}/plots" "${result_dir}/peaks" "${result_dir}/homer_motifs"
+
+echo "=== ChIP-seq pipeline started ==="
+echo "Raw FASTQ dir   : ${raw_fqdir}"
+echo "Clean FASTQ dir : ${clean_fqdir}"
+echo "Result dir      : ${result_dir}"
+echo
+
+# ============================================================================
+# Step 1: Quality Control with fastp
+# ============================================================================
+echo "=== Step 1: Quality Control with fastp ==="
+
+shopt -s nullglob
+r1_files=("${raw_fqdir}"/*_R1.fq.gz)
+if [ ${#r1_files[@]} -eq 0 ]; then
+    echo "ERROR: No *_R1.fq.gz files found in ${raw_fqdir}"
+    exit 1
+fi
+
+for f1 in "${r1_files[@]}"; do
+    base=$(basename "${f1}" _R1.fq.gz)
+    f2="${raw_fqdir}/${base}_R2.fq.gz"
+
+    if [ ! -f "${f2}" ]; then
+        echo "WARNING: R2 not found for ${base}, skip."
+        continue
+    fi
+
+    clean_r1="${clean_fqdir}/${base}_R1.clean.fq.gz"
+    clean_r2="${clean_fqdir}/${base}_R2.clean.fq.gz"
+    html_report="${clean_fqdir}/${base}.fastp.html"
+    json_report="${clean_fqdir}/${base}.fastp.json"
+
+    echo "Processing sample (fastp): ${base}"
+    echo "  R1 -> ${clean_r1}"
+    echo "  R2 -> ${clean_r2}"
+
+    fastp \
+        -i "${f1}" -I "${f2}" \
+        -o "${clean_r1}" -O "${clean_r2}" \
+        --thread "${p}" \
+        -h "${html_report}" \
+        -j "${json_report}"
+
+    echo
+done
+shopt -u nullglob
+
+echo "=== Step 1 completed ==="
+echo
+
+# ============================================================================
+# Step 2: Alignment (Bowtie2) + BAM processing (samtools) + BigWig & plots
+#        + Peak calling (MACS3) + Motif (HOMER)
+# ============================================================================
+echo "=== Step 2: Alignment & Peak Calling & Motif ==="
+
+shopt -s nullglob
+clean_r1_files=("${clean_fqdir}"/*_R1.clean.fq.gz)
+if [ ${#clean_r1_files[@]} -eq 0 ]; then
+    echo "ERROR: No cleaned *_R1.clean.fq.gz files found in ${clean_fqdir}"
+    exit 2
+fi
+
+for r1 in "${clean_r1_files[@]}"; do
+    base=$(basename "${r1}" _R1.clean.fq.gz)
+    r2="${clean_fqdir}/${base}_R2.clean.fq.gz"
+    sample_name="${base}"
+
+    if [ ! -f "${r2}" ]; then
+        echo "WARNING: Cleaned R2 not found for ${base}, skip."
+        continue
+    fi
+
+    echo ">>> Processing sample: ${sample_name}"
+    echo "  Clean R1: ${r1}"
+    echo "  Clean R2: ${r2}"
+
+    raw_bam="${result_dir}/${sample_name}.raw.bam"
+    name_sorted_bam="${result_dir}/${sample_name}.name_sorted.bam"
+    fixmate_bam="${result_dir}/${sample_name}.fixmate.bam"
+    pos_sorted_bam="${result_dir}/${sample_name}.pos_sorted.bam"
+    final_bam="${result_dir}/${sample_name}.final.bam"
+    final_bai="${result_dir}/${sample_name}.final.bam.bai"
+    bw_file="${result_dir}/${sample_name}.rpkm.bw"
+    matrix_file="${result_dir}/matrix/${sample_name}_matrix.gz"
+    heatmap_pdf="${result_dir}/plots/${sample_name}_heatmap.pdf"
+    bowtie2_log="${result_dir}/${sample_name}.bowtie2.log"
+
+    # ----------------- 2.1 Bowtie2 比对 + 过滤染色体 + 基本过滤 -----------------
+    echo "[1/6] Alignment with Bowtie2 and basic filtering..."
+    bowtie2 \
+        -1 "${r1}" -2 "${r2}" \
+        -x "${ref_index}" \
+        -p "${p}" \
+        2> "${bowtie2_log}" | \
+        grep -E -v "chrM|random|chrUn_|chrMT|KI|GL" | \
+        samtools view \
+            -@ "${p}" \
+            -F 1804 -f 2 -q 30 \
+            -b \
+            -o "${raw_bam}"
+
+    # ----------------- 2.2 BAM 去重准备：sort by name + fixmate + sort by position -----------------
+    echo "[2/6] BAM sorting and fixmate..."
+    samtools sort -@ "${p}" -n -o "${name_sorted_bam}" "${raw_bam}"
+    samtools fixmate -@ "${p}" -m "${name_sorted_bam}" "${fixmate_bam}"
+    samtools sort -@ "${p}" -o "${pos_sorted_bam}" "${fixmate_bam}"
+
+    # ----------------- 2.3 去重 + index -----------------
+    echo "[3/6] Mark duplicates and index..."
+    samtools markdup -@ "${p}" -r "${pos_sorted_bam}" "${final_bam}"
+    samtools index "${final_bam}"
+
+    # ----------------- 2.4 生成 BigWig (deeptools bamCoverage) -----------------
+    echo "[4/6] Generating BigWig with deepTools (bamCoverage)..."
+    bamCoverage \
+        -b "${final_bam}" \
+        -o "${bw_file}" \
+        --ignoreDuplicates \
+        --binSize 10 \
+        --normalizeUsing RPKM \
+        --numberOfProcessors "${p}"
+
+    # ----------------- 2.5 计算矩阵并画热图 (computeMatrix + plotHeatmap) -----------------
+    echo "[5/6] Generating matrix and heatmap around TSS..."
+    computeMatrix scale-regions \
+        -S "${bw_file}" \
+        -R "${tss_bed}" \
+        --beforeRegionStartLength 2000 \
+        --afterRegionStartLength 2000 \
+        -p "${p}" \
+        -o "${matrix_file}"
+
+    plotHeatmap \
+        -m "${matrix_file}" \
+        -out "${heatmap_pdf}" \
+        --missingDataColor "#cc2200"
+
+    # ----------------- 2.6 MACS3 Peak calling -----------------
+    echo "[6/6] Calling peaks with MACS3..."
+    macs3 callpeak \
+        -t "${final_bam}" \
+        -f BAMPE \
+        -g mm \
+        -n "${sample_name}" \
+        --outdir "${result_dir}/peaks" \
+        -B \
+        --nolambda \
+        --keep-dup all \
+        --call-summits \
+        -p 0.05
+
+    # =========================================================================
+    # Step 3: HOMER Motif Analysis for each sample
+    # =========================================================================
+    echo "=== Step 3: HOMER motif analysis for ${sample_name} ==="
+
+    peak_file="${result_dir}/peaks/${sample_name}_peaks.narrowPeak"
+
+    if [ -f "${peak_file}" ]; then
+        homer_dir="${result_dir}/homer_motifs/${sample_name}"
+        mkdir -p "${homer_dir}"
+
+        echo "Running HOMER findMotifsGenome.pl with default background..."
+        findMotifsGenome.pl \
+            "${peak_file}" \
+            mm10 \
+            "${homer_dir}" \
+            -size 200 \
+            -mask \
+            -p "${p}" \
+            -preparse \
+            -cache 5000 \
+            2>&1 | tee "${homer_dir}/homer.log"
+
+        echo "HOMER motif analysis completed for ${sample_name}"
+    else
+        echo "WARNING: Peak file not found for ${sample_name}: ${peak_file}"
+    fi
+
+    # ----------------- 清理中间 BAM -----------------
+    echo "Cleaning temporary BAM files for ${sample_name}..."
+    rm -f "${raw_bam}" "${name_sorted_bam}" "${fixmate_bam}" "${pos_sorted_bam}"
+
+    echo ">>> Sample ${sample_name} finished."
+    echo
+done
+shopt -u nullglob
+
+# ============================================================================
+# Optional: Comparative HOMER analysis across all samples
+# ============================================================================
+echo "=== Optional: Comparative HOMER analysis across all samples ==="
+
+shopt -s nullglob
+peak_files=("${result_dir}/peaks/"*_peaks.narrowPeak)
+if [ ${#peak_files[@]} -gt 1 ]; then
+    compare_dir="${result_dir}/homer_motifs/compare_all"
+    mkdir -p "${compare_dir}"
+
+    combined_peak="${compare_dir}/combined_peaks.bed"
+    cat "${peak_files[@]}" > "${combined_peak}"
+
+    echo "Running HOMER comparative motif analysis on combined peaks..."
+    findMotifsGenome.pl \
+        "${combined_peak}" \
+        mm10 \
+        "${compare_dir}" \
+        -size 200 \
+        -mask \
+        -p "${p}" \
+        2>&1 | tee "${compare_dir}/homer_compare.log"
+else
+    echo "Skip comparative HOMER: need >1 peak file, found ${#peak_files[@]}."
+fi
+shopt -u nullglob
+
+echo
+echo "=== All samples processed successfully! ==="
+echo "Alignment / BAM / BigWig / peaks: ${result_dir}"
+echo "Motif results (per-sample & combined): ${result_dir}/homer_motifs/"
