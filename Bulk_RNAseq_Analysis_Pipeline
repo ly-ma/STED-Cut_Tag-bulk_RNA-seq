@@ -1,0 +1,152 @@
+# Bulk RNA-seq Analysis Processing 
+# Author: jx-yang 
+## 加载必要 R 包 -----------------------------------------------------------
+library(ggplot2)
+library(ggrepel)
+library(pheatmap)
+library(DESeq2)
+library(matrixStats)  
+
+## 读取表达矩阵并构建 DESeq2 对象 -----------------------------------------
+data0 <- read.csv("oeCASZ1_HUVEC_fpkm.csv",
+                  row.names = 1,
+                  check.names = FALSE)
+
+colnames(data0) <- c("Ctrl_1", "Ctrl_2", "Casz1_OE1", "Casz1_OE2")
+
+colData <- data.frame(
+  condition = c("Ctrl", "Ctrl", "oe", "oe"),
+  row.names = colnames(data0)
+)
+
+dds <- DESeqDataSetFromMatrix(
+  countData = round(as.matrix(data0)),
+  colData   = colData,
+  design    = ~ condition
+)
+
+dds <- dds[rowSums(counts(dds)) > 1, ]
+
+dds <- estimateSizeFactors(dds)
+rld <- rlog(dds, blind = FALSE)
+
+
+## 样本相关性热图 -----------------------------------------------------------
+topVarGenes <- head(order(rowVars(assay(rld)), decreasing = TRUE), 500)
+
+correlationMatrix <- cor(assay(rld)[topVarGenes, ])
+SampleDisMatrix   <- 1 - correlationMatrix
+
+colnames(correlationMatrix) <- rownames(colData)
+rownames(correlationMatrix) <- rownames(colData)
+
+p1 <- pheatmap(
+  correlationMatrix,
+  clustering_distance_cols = as.dist(SampleDisMatrix),
+  clustering_distance_rows = as.dist(SampleDisMatrix),
+  scale = "none"
+)
+
+print(p1)
+
+
+## PCA 分析 ----------------------------------------------------------------
+pca <- prcomp(t(assay(rld)[topVarGenes, ]), center = TRUE, scale. = FALSE)
+xy  <- as.data.frame(pca$x)
+
+expVar   <- round((pca$sdev)^2 / sum((pca$sdev)^2) * 100, 2)
+xlab_pc1 <- paste0("PC1 (", expVar[1], "% variance)")
+ylab_pc2 <- paste0("PC2 (", expVar[2], "% variance)")
+
+xy$condition <- colData$condition
+xy$group     <- rownames(xy)
+
+p2 <- ggplot(xy, aes(x = PC1, y = PC2)) +
+  geom_point(aes(color = factor(group)), size = 4) +
+  theme_bw() +
+  labs(
+    color = "Sample",
+    x     = xlab_pc1,
+    y     = ylab_pc2
+  ) +
+  xlim(c(-2, 2)) +
+  ylim(c(-0.8, 0.8))
+
+print(p2)
+
+
+## 差异基因分析 -----------------------------------------------------------
+dds <- DESeq(dds)
+
+cut_off_pvalue <- 0.05
+
+res <- results(dds, contrast = c("condition", "oe", "Ctrl"))
+res <- as.data.frame(res)
+res$genes <- rownames(res)
+
+res$Sig <- ifelse(
+  res$pvalue < cut_off_pvalue,
+  ifelse(res$log2FoldChange > 0, "Casz1_OE_UP", "Ctrl_UP"),
+  "None"
+)
+
+table(res$Sig)
+
+
+## MA图 --------------------------------------------------------------
+genes_to_label <- c("CASZ1")
+
+p3 <- ggplot(res, aes(x = log2(baseMean + 1), y = log2FoldChange, color = Sig)) +
+  geom_point(alpha = 1, size = 2.5) +
+  scale_color_manual(
+    values = c(
+      "Casz1_OE_UP" = "red",
+      "Ctrl_UP"     = "blue",
+      "None"        = "#d2dae2"
+    )
+  ) +
+  geom_hline(yintercept = 0, lty = 4, col = "black", lwd = 0.3) +
+  labs(
+    x = "Log2(mean expression)",
+    y = "Log2(Fold Change)",
+    title = "MA Plot"
+  ) +
+  theme_bw() +
+  theme(
+    panel.grid      = element_blank(),
+    plot.title      = element_text(hjust = 0.5),
+    legend.position = "right",
+    legend.title    = element_blank()
+  ) +
+  coord_cartesian(ylim = c(-5, 10), xlim = c(0, 12)) +
+  geom_text_repel(
+    data = subset(res, genes %in% genes_to_label),
+    aes(label = genes),
+    size          = 4,
+    box.padding   = 0.3,
+    point.padding = 0.5,
+    color         = "black",
+    segment.color = "black"
+  )
+
+print(p3)
+
+
+## 差异基因表达热图 -------------------------------------------------------
+d1 <- assay(rld)
+selected_genes <- c(Casz1_OE_enrich, Ctrl_enrich)
+selected_genes <- selected_genes[!is.na(selected_genes)]
+
+selected_genes_matrix <- d1[match(selected_genes, rownames(d1)), ]
+
+p_heat <- pheatmap(
+  selected_genes_matrix,
+  cluster_rows   = FALSE,
+  cluster_cols   = FALSE,
+  scale          = "row",
+  show_rownames  = TRUE,
+  show_colnames  = TRUE,
+  color          = colorRampPalette(c("#0060a6", "white", "firebrick3"))(100)
+)
+
+print(p_heat)
